@@ -4,7 +4,7 @@ import { openrouterImagesApi } from "../api/openrouter-images.lazy.ts";
 import { typesafeSystemOneApi } from "../api/typesafe-system-one.lazy.ts";
 import { envApiKeyAuth, lazyOAuth } from "../auth/helpers.ts";
 import { loadOpenRouterOAuth } from "../auth/oauth/load.ts";
-import { createProvider, type Provider, type RefreshModelsContext } from "../models.ts";
+import { createProvider, type Provider, type ProviderModel, type RefreshModelsContext } from "../models.ts";
 import type { AnyModel } from "../types.ts";
 import { isModelType } from "../utils/model-operations.ts";
 import { OPENROUTER_CLASSIFIER_MODELS, OPENROUTER_IMAGE_MODELS, OPENROUTER_MODELS } from "./openrouter.models.ts";
@@ -74,8 +74,12 @@ export function openrouterProvider(): Provider<"anthropic-messages" | "openai-co
 		},
 		models: [
 			...Object.values(OPENROUTER_MODELS),
-			...Object.values(OPENROUTER_IMAGE_MODELS),
-			...Object.values(OPENROUTER_CLASSIFIER_MODELS),
+			// Local patch (offline build): when the generated catalog contains no
+			// image/classifier models, their mapped types are empty and Object.values()
+			// infers unknown[], which is not assignable to ProviderModel[]. Cast so the
+			// build works with empty catalogs; runtime behavior is unchanged.
+			...(Object.values(OPENROUTER_IMAGE_MODELS) as ProviderModel<"anthropic-messages" | "openai-completions">[]),
+			...(Object.values(OPENROUTER_CLASSIFIER_MODELS) as ProviderModel<"anthropic-messages" | "openai-completions">[]),
 		],
 		api: {
 			"anthropic-messages": anthropicMessagesApi(),

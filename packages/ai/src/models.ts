@@ -142,7 +142,9 @@ function withKnownModelTypes(entry: ModelsStoreEntry): ModelsStoreEntry {
 }
 
 /** Any model a provider with chat APIs `TApi` can list. */
-type ProviderModel<TApi extends Api> = Model<TApi> | ImageModel<ImageApi> | ClassifierModel<ClassifierApi>;
+// Local patch (offline build): exported so openrouter.ts can type-assert empty
+// image/classifier catalogs without duplicating the union definition here.
+export type ProviderModel<TApi extends Api> = Model<TApi> | ImageModel<ImageApi> | ClassifierModel<ClassifierApi>;
 
 /**
  * A provider is the concrete runtime unit. It owns id/name/base metadata,
