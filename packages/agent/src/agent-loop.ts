@@ -3,6 +3,22 @@
  * Transforms to Message[] only at the LLM call boundary.
  */
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 【设计思想·总纲】
+// 本文件是 Pi 的「心脏」——agent 循环。它体现 Pi 最核心的一条设计原则：
+//
+//   「只在一个边界上做消息类型转换」——内部全程使用 AgentMessage（带时间戳、
+//    usage、工具调用等完整信息），直到真正调用 LLM 的那一刻（streamAssistantResponse）
+//    才一次性转成 provider 认识的 Message[]。
+//
+// 这样做的价值：
+//   1. 循环逻辑（工具执行、队列、状态）完全不关心 provider 差异，可被任意复用；
+//   2. 事件流（AgentEvent）是「纯函数 + 回调」驱动的，没有任何隐式全局状态，
+//      同一套循环既能被 coding-agent 的交互模式用，也能被 JSON/RPC/SDK 模式用；
+//   3. 所有可定制点（prepareRequest / prepareNextTurn / beforeToolCall / afterToolCall /
+//      finishTurn）都通过 config 注入，循环本身保持「最小内核 + 可插拔钩子」。
+// ═══════════════════════════════════════════════════════════════════════════
+
 import {
 	type AssistantMessage,
 	type ClientIdentity,
@@ -194,6 +210,16 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 // - 内层循环：处理工具调用和转向消息，直到本回合不再有工具调用、也没有排队消息为止。
 // - 外层循环：Agent 本应停下时，检查是否又来了 follow-up 消息，有则再进入内层循环继续。
 // 每轮都会经过「准备下一轮 → 处理排队消息 → prepareRequest → 流式请求模型 → 执行工具」的完整流程。
+//
+// 【设计思想·核心循环 = 事件驱动状态机】
+// 一个 coding agent 的本质其实就这么大：向模型请求 → 拿回响应 → 若有工具调用就执行
+// 并把结果回填 → 再请求，直到模型不再调用工具为止。Pi 把这条链路建模成一个
+// 「事件驱动」的过程——每个阶段（turn_start / message_* / tool_execution_* / turn_end /
+// agent_end）都通过 emit() 向外发事件，循环本身不关心「谁来消费这些事件」。
+// 这带来两个关键收益：
+//   1. 关注点分离：循环只负责「推进状态」，渲染/持久化/权限检查等由上层订阅事件完成；
+//   2. 可测试、可观测：任何时刻的状态都可通过事件流重建，正是 durable 包「先落盘再展示」
+//      这一持久化思想的基石（事件流天然可重放）。
 async function runLoop(
 	initialContext: AgentContext,
 	newMessages: AgentMessage[],
@@ -396,6 +422,15 @@ async function runLoop(
  * the executable set, so replay always yields exactly `context.tools`. Otherwise a new
  * system message is inserted before the first non-system pending message.
  */
+
+// 【设计思想·「运行时工具」与「声明给模型的工具」分离】
+// 这是 Pi 一个很精妙的设计：`context.tools` 是运行时「真正能执行」的工具集合，
+// 而对话记录里 system 消息声明的是「模型被允许调用」的工具集合——两者可以不同。
+// 每轮请求前算出二者的差异（toolsAdded / toolsRemoved），只把「变化量」写进 system 消息，
+// 而不是每轮都全量重发工具列表。价值有二：
+//   1. 省 token：工具没变时零额外开销；
+//   2. 可重放：无论怎么回放这段对话，工具集合都能精确收敛到 `context.tools`，
+//      这对 durable 包「崩溃后从存储恢复、状态可复现」的持久化模型至关重要。
 function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage[]): AgentMessage[] {
 	// 在待处理消息里从后往前找 system 消息的位置（system 消息承载工具声明）。
 	let systemIndex = -1;
@@ -462,6 +497,13 @@ function withToolChanges(message: SystemMessage, { toolsAdded, toolsRemoved }: T
 // 5. 遍历流事件：start 时把部分消息放进上下文并发 message_start；
 //    中间的各种 delta 事件更新部分消息并发 message_update；
 //    done/error 时用最终结果收尾并发 message_end。
+//
+// 【设计思想·provider 差异收敛在「流事件」这一层】
+// Pi 的 ai 包把 30+ 家 provider（OpenAI/Anthropic/DeepSeek/…）全部归一化成同一种
+// 「流事件协议」（start / text_delta / thinking_delta / toolcall_delta / done…）。
+// 本函数是这层抽象的消费者：它面对的不是某家具体 provider，而是统一的事件流，
+// 于是「把流式增量组装成一条 assistant 消息」的逻辑只写一遍就适用于所有 provider。
+// 这正是分层架构「下层屏蔽外部差异、上层只面向一套类型编程」的典型体现。
 async function streamAssistantResponse(
 	context: AgentContext,
 	config: AgentLoopConfig,
@@ -572,6 +614,12 @@ async function streamAssistantResponse(
 // 原因：流式工具调用参数是用「尽力而为的 JSON 挽救解析」定稿的，截断的消息可能产出
 // 参数看似能解析校验、实则悄悄不完整的工具调用——它们都不安全，不能执行，
 // 所以逐条上报错误，让模型重新补发完整参数。
+//
+// 【设计思想·对「不确定状态」宁保守不冒险】
+// 截断的工具调用参数属于典型的「部分可信」状态：它能通过解析、能通过 schema 校验，
+// 但内容可能悄悄缺尾巴。Pi 的选择是——一律不执行，改成错误回给模型让它重发。
+// 这体现 agent 工程里一条重要原则：工具执行是「有副作用」的动作（可能改文件、跑命令），
+// 面对不确定输入时，宁可多一轮往返（让模型重试），也绝不在信息不完整时贸然执行。
 async function failToolCallsFromTruncatedMessage(
 	toolCalls: AgentToolCall[],
 	emit: AgentEventSink,
@@ -828,6 +876,13 @@ function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall)
 // - immediate：无需真正执行（工具找不到 / 参数校验失败 / 被 beforeToolCall 拦截 / 已中止），
 //   直接带着错误结果。
 // - prepared：一切就绪，返回工具、调用、校验后的参数，供后续真正执行。
+//
+// 【设计思想·钩子「可拦截」而非「只能观察」——扩展即权限】
+// beforeToolCall 钩子返回 `block: true` 就能拦下这次工具调用，`terminate: true` 还能终止
+// 整轮。这是 Pi 扩展体系的关键：Pi 内核本身「没有内置权限系统」（这是它刻意保持极简的
+// 一部分），但通过这个钩子，外部扩展可以实现任意粒度的权限管控（用户确认、白名单、
+// 审批流……）。也就是说，权限不是硬编码在循环里，而是「以插件的形式注入」。
+// 这就是 Pi 自我扩展（self-extensible）哲学的落点：内核只提供「拦截点」，策略交给扩展。
 async function prepareToolCall(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
@@ -950,6 +1005,12 @@ export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallO
 // 关键点：调用工具自带的 execute，并传入一个 onUpdate 回调来收集执行过程中的部分结果。
 // 无论 execute 成功还是抛错，都归一化成 ExecutedToolCallOutcome（带 isError 和耗时），
 // 不向外抛异常；执行中收到部分结果会先收集、最后统一 flush。
+//
+// 【设计思想·「错误永不外抛」——把失败当作数据而非异常】
+// 工具执行失败（抛异常、返回 isError、参数非法）时，这里不会 throw 打断整个 agent，
+// 而是统一转成一个 `isError: true` 的正常结果回填给模型。这样模型能看到错误描述，
+// 自己决定「换种方式重试」还是「放弃」。这比「抛异常终止整轮」健壮得多：
+// agent 语境下，失败本身就是上下文的一部分，模型需要看到它才能自我修正。
 async function executePreparedToolCall(
 	prepared: PreparedToolCall,
 	signal: AbortSignal | undefined,

@@ -136,6 +136,13 @@ function createMutableAgentState(initialState?: AgentInitialState): MutableAgent
 // 构造 Agent 时可选的各种钩子和配置项。
 // 这些几乎都是「可插拔扩展点」：调用方通过传入不同的回调，定制 Agent 的行为，
 // 而不需要改动 Agent 本身的循环逻辑。这是 Pi 可扩展设计的核心载体之一。
+//
+// 【设计思想·「配置即扩展」——用注入替代继承】
+// Agent 的行为定制不是靠「继承 Agent 类重写方法」，而是靠构造时注入一堆回调
+// （convertToLlm / transformContext / beforeToolCall / afterToolCall / finishTurn…）。
+// 这符合「组合优于继承」的原则：每个能力都是可独立替换的单元，测试时可以随意
+// mock 其中任意一个；也解释了为什么 Pi 内核能保持极简——复杂能力都以钩子的形式
+// 被「塞进来」，而不是写死在循环里。
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
 	initialState?: AgentInitialState;
@@ -175,6 +182,15 @@ export interface AgentOptions {
 // 用于暂存「steering（转向）消息」和「follow-up（后续）消息」——
 // 这两类消息不是立刻发给模型，而是要等当前 assistant 回合结束后再注入。
 // mode 控制每次取消息时的粒度：all = 一次取全部，one-at-a-time = 一次只取一条。
+//
+// 【设计思想·steering 与 follow-up 的语义区分——「插话」vs「续跑」】
+// Pi 把「运行途中新增的消息」细分成两个队列，语义完全不同：
+//   - steering（转向）：等当前回合结束就立刻注入，用来「改变方向」（比如用户打断
+//     说"别做这个了，先看那个"）；
+//   - follow-up（后续）：只有 agent 本应停止时才会执行，用来「追加任务」（比如"做完
+//     再顺便跑一下测试"）。
+// 这种区分让「人类与正在运行的 agent 协作」变得可控：既能打断、又能追加，
+// 而不用粗暴地 abort 再重启。这是交互式 agent 体验设计上很关键的一层考量。
 class PendingMessageQueue {
 	private messages: AgentMessage[] = [];
 	public mode: QueueMode;
@@ -233,6 +249,13 @@ type ActiveRun = {
 // 它负责：持有当前对话记录、发出生命周期事件、执行工具，
 // 以及提供 steer() / followUp() 之类的消息排队接口。
 // 上层（如 coding-agent 包）直接跟这个类打交道，而不是跟裸的循环函数打交道。
+//
+// 【设计思想·「纯函数内核 + 有状态外壳」的分层】
+// Pi 把 agent 拆成两层：agent-loop.ts 是纯函数式的循环（无状态、可复用、可测试），
+// 而本文件的 Agent 类是有状态的外壳——持有 transcript、管理队列、暴露 abort/waitForIdle
+// 等生命周期 API。这样上层拿到的是一个「对象」而非「函数」，天然适合长生命周期的
+// 交互式应用；而底层的纯函数循环又可以被任何框架（甚至你自己写的）复用。
+// 一句话：核心逻辑越纯、越容易被复用；状态封装越薄、越容易替换。
 export class Agent {
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
@@ -549,9 +572,15 @@ export class Agent {
 		});
 	}
 
-	// 生成当前上下文的快照（拷贝 messages 和 tools），
-	// 传给底层循环，避免循环执行过程中外部对状态的修改影响本次运行。
-	private createContextSnapshot(): AgentContext {
+// 生成当前上下文的快照（拷贝 messages 和 tools），
+// 传给底层循环，避免循环执行过程中外部对状态的修改影响本次运行。
+//
+// 【设计思想·「上下文快照」隔离运行期与外部修改】
+// 一次运行开始前，把 messages 和 tools 各做一次 slice() 拷贝再交给循环。
+// 这样运行过程中，外部无论怎么改 Agent 的状态（比如用户又 steer 了新消息、或换了工具集），
+// 都不会污染正在进行的这一轮。这让「并发的输入」与「正在执行的运行」互不干扰，
+// 是保证循环可预测、可复现的重要一环——尤其对 durable 的崩溃恢复语义很关键。
+private createContextSnapshot(): AgentContext {
 		return {
 			messages: this._state.messages.slice(),
 			tools: this._state.tools.slice(),
@@ -602,13 +631,19 @@ export class Agent {
 		};
 	}
 
-	// 统一的生命周期包装器：任何一次运行（prompt / continue）都从这里进出。
-	// 职责：
-	// 1. 防止重入（已有活跃运行时直接报错）。
-	// 2. 创建本次运行的 AbortController 和 Promise，登记到 activeRun。
-	// 3. 把状态置为 isStreaming，执行 executor。
-	// 4. 异常时调用 handleRunFailure 兜底；无论如何最后调用 finishRun 收尾。
-	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+// 统一的生命周期包装器：任何一次运行（prompt / continue）都从这里进出。
+// 职责：
+// 1. 防止重入（已有活跃运行时直接报错）。
+// 2. 创建本次运行的 AbortController 和 Promise，登记到 activeRun。
+// 3. 把状态置为 isStreaming，执行 executor。
+// 4. 异常时调用 handleRunFailure 兜底；无论如何最后调用 finishRun 收尾。
+//
+// 【设计思想·「AbortController 贯穿全链路」——把中断建模成一等公民】
+// 每次运行都有一个专属的 AbortController，其 signal 会被一路传给底层循环、streamFunction、
+// 工具执行，乃至事件监听器。用户想中断（Ctrl+C / abort()）时，只需触发这一个 signal，
+// 所有正在 await 的环节都能感知到并优雅退出，而不是粗暴杀进程。这种「取消信号显式下传」
+// 的模式，让 agent 在面对长任务时也能被干净地打断——是健壮性设计的核心。
+private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing.");
 		}
@@ -671,15 +706,22 @@ export class Agent {
 	 * considered idle later, after all awaited listeners for `agent_end` finish
 	 * and `finishRun()` clears runtime-owned state.
 	 */
-	// 处理一个循环事件，分两步：
-	// 第一步，根据事件类型更新 Agent 内部状态——
-	//   message_start/message_update 更新当前流式消息；
-	//   message_end 把消息真正追加进对话历史；
-	//   tool_execution_start/end 维护「正在执行中的工具调用」集合；
-	//   turn_end 若 assistant 消息带 errorMessage 则记录到 errorMessage；
-	//   agent_end 清空流式消息。
-	// 第二步，把事件按订阅顺序逐个 await 转发给所有监听器。
-	private async processEvents(event: AgentEvent): Promise<void> {
+// 处理一个循环事件，分两步：
+// 第一步，根据事件类型更新 Agent 内部状态——
+//   message_start/message_update 更新当前流式消息；
+//   message_end 把消息真正追加进对话历史；
+//   tool_execution_start/end 维护「正在执行中的工具调用」集合；
+//   turn_end 若 assistant 消息带 errorMessage 则记录到 errorMessage；
+//   agent_end 清空流式消息。
+// 第二步，把事件按订阅顺序逐个 await 转发给所有监听器。
+//
+// 【设计思想·「归约 + 广播」的事件处理模式】
+// 一个事件到了这里做两件事：先「归约」（reducer）——根据事件类型把 Agent 内部状态更新到
+// 最新；再「广播」——按订阅顺序 await 转发给所有监听器。这其实是函数式编程里
+// reducer 思想的落地：Agent 的状态 = 一系列事件折叠（fold）的结果，任何时刻的状态都
+// 可从事件流重建。这为 durable 包的「持久化 + 崩溃恢复」提供了天然基础——因为状态
+// 本质上是事件流的函数，重放事件就能恢复状态。
+private async processEvents(event: AgentEvent): Promise<void> {
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message;
