@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
+set -euo pipefail # Bash 的"严格模式"，一次开启三个保险：
+#算出脚本自己所在的目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Check for --no-env flag
